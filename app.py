@@ -5,14 +5,12 @@ import streamlit as st
 st.set_page_config(page_title="Numerals & Units Audit", page_icon="📏", layout="wide")
 st.title("📏 Numerals & Units Audit")
 
-# ---- Diagnostics (optional) ----
 with st.expander("Environment diagnostics", expanded=False):
     st.write("**Python**", sys.version)
     st.write("**CWD**", os.getcwd())
     st.write("**Files in CWD**", os.listdir("."))
     st.write("**Top installed packages**", [m.name for m in list(pkgutil.iter_modules())][:50])
 
-# ---- Import library (renamed to avoid collisions) ----
 try:
     from audit_lib import audit_files
 except Exception:
@@ -23,15 +21,24 @@ except Exception:
 with st.sidebar:
     st.markdown("**Supported file types**")
     st.markdown("- TXT / MD\n- DOCX\n- PPTX\n- XLSX / CSV / TSV\n- XLIFF / XLF / MXLIFF / SDLXLIFF")
-    st.caption("Tip: Upload an XLIFF as source (reads <source>) and another XLIFF as target (reads <target>).")
+    st.caption("Tip: Upload XLIFF as source (reads `<source>`) and XLIFF as target (reads `<target>`).")
+    st.divider()
+    ignore_short = st.checkbox("Ignore 1–2 digit standalone numbers", value=True, key="ignore_short_nums")
+    tol = st.number_input("Pair value tolerance (float)", value=1e-9, format="%.1e", key="float_tol")
+    st.caption("Use a bigger tolerance if rounding differences (e.g., 3.50 vs 3.5) cause noise.")
+    ignore_patterns_str = st.text_area(
+        "Ignore patterns (one regex per line, applied to the line containing a pure number)",
+        value="^\\s*\\d+\\s*$\nFigure\\s+\\d+\nTable\\s+\\d+",
+        height=120,
+        key="ignore_patterns",
+    )
 
-# Stable, run-unique key prefix to avoid DuplicateElementId
+# Unique key prefix
 if "run_id" not in st.session_state:
     import uuid
     st.session_state["run_id"] = str(uuid.uuid4())[:8]
 KP = f"audit_{st.session_state['run_id']}_"
 
-# ---- Inputs ----
 src_file = st.file_uploader(
     "Upload Source File",
     type=["txt","md","docx","pptx","xlsx","csv","tsv","xliff","xlf","mxliff","sdlxliff"],
@@ -50,7 +57,6 @@ else:
 
 run = st.button("Run Audit", type="primary", disabled=not (src_file and tgt_file), key=KP + "btn_run")
 
-# ---- Run ----
 if run:
     try:
         st.info("Saving uploads…", icon="💾")
@@ -67,11 +73,17 @@ if run:
         st.success(f"Saved: {src_path.name} • {tgt_path.name}", icon="✅")
         st.info("Running audit…", icon="🔎")
 
-        result = audit_files(src_path, tgt_path)
+        ignore_patterns = [ln for ln in ignore_patterns_str.splitlines() if ln.strip()]
+        result = audit_files(
+            src_path,
+            tgt_path,
+            ignore_short_standalone=ignore_short,
+            ignore_patterns=ignore_patterns,
+            float_tol=float(tol),
+        )
 
         st.success("Audit complete.", icon="✅")
 
-        # Summary
         st.subheader("Summary", anchor=False)
         st.dataframe(result["Summary"], use_container_width=True, key=KP + "df_summary")
 
@@ -90,7 +102,6 @@ if run:
             key=KP + "download_xlsx",
         )
 
-        # Details
         with st.expander("Missing pairs in target", expanded=False):
             st.dataframe(result["Missing_in_Target"], use_container_width=True, key=KP + "df_missing")
         with st.expander("Extra pairs in target", expanded=False):
