@@ -35,7 +35,9 @@ def _lazy_imports():
         except Exception:
             etree = None
 
-# ---- Numeric normalization helpers ----
+# =========================
+# Numeric normalization
+# =========================
 ARABIC_INDIC = dict(zip("٠١٢٣٤٥٦٧٨٩", "0123456789"))
 EASTERN_ARABIC_INDIC = dict(zip("۰۱۲۳۴۵۶۷۸۹", "0123456789"))
 
@@ -71,7 +73,10 @@ def normalize_number_str(num: str) -> str:
             else:
                 num = num.replace(".", "")
 
+    # Remove spaces as thousands separators
     num = re.sub(r"\s(?=\d{3}(\D|$))", "", num)
+    # Strip leading zeros safely (keep "0.x")
+    num = re.sub(r"(?<!\d)0+(\d+)", r"\1", num)
     return num
 
 def as_float_safe(num: str):
@@ -80,7 +85,9 @@ def as_float_safe(num: str):
     except Exception:
         return None
 
-# ---- Patterns ----
+# =========================
+# Patterns
+# =========================
 UNIT_REGEX = r"(?:%|％|°[CF]?|℃|℉|V|mV|kV|A|mA|µA|Ω|ohm|W|kW|MW|Wh|kWh|mAh|J|kJ|Nm|N·m|N-m|Pa|kPa|MPa|bar|mbar|mmHg|psi|Hz|kHz|MHz|GHz|rpm|r/min|s|min|h|hr|d|ms|µs|mol|ppm|ppb|pH|lx|dB|m|cm|mm|km|µm|nm|in|ft|yd|L|mL|µL|kg|g|mg|µg|lb|oz|°|deg|C|F|m/s|km/h|IU|UI/mL|CFU/g)"
 NUM_REGEX  = r"[+\-]?(?:\d|\u0660-\u0669|\u06F0-\u06F9)[\d\u0660-\u0669\u06F0-\u06F9\s.,]*\d"
 
@@ -109,7 +116,10 @@ def canonical_number(num: str):
     f = as_float_safe(n_str)
     return (n_str, f if f is not None else float("nan"))
 
-def find_pairs(text: str):
+# =========================
+# Extraction helpers
+# =========================
+def find_pairs_with_spans(text: str) -> List[Tuple[str, str, int, int]]:
     out = []
     for m in PAIR_REGEX.finditer(text):
         if m.group("num") and m.group("unit"):
@@ -121,10 +131,45 @@ def find_pairs(text: str):
         out.append((num, unit, s, e))
     return out
 
-def find_pure_numbers(text: str):
+def find_pure_numbers_with_spans(text: str) -> List[Tuple[str, int, int]]:
     return [(m.group("num"), m.start(), m.end()) for m in PURE_NUM_REGEX.finditer(text)]
 
-# ---- Readers (txt, docx, pptx, xlsx/csv/tsv, XLIFF/MXLIFF) ----
+def _subtract_overlaps(pure_nums: List[Tuple[str,int,int]], pair_spans: List[Tuple[int,int]]) -> List[Tuple[str,int,int]]:
+    """Remove any pure number whose span overlaps any number+unit pair span."""
+    if not pair_spans:
+        return pure_nums
+    pr = []
+    for n, s, e in pure_nums:
+        has_overlap = any(not (e <= ps or s >= pe) for ps, pe in pair_spans)
+        if not has_overlap:
+            pr.append((n, s, e))
+    return pr
+
+def _apply_ignore_rules(text: str, items: List[Tuple[str,int,int]], ignore_short_standalone: bool, ignore_patterns: Optional[List[str]]) -> List[Tuple[str,int,int]]:
+    """Apply heuristics to reduce false positives."""
+    out = []
+    compiled = [re.compile(p, flags=re.IGNORECASE) for p in (ignore_patterns or [])]
+    for n, s, e in items:
+        # Drop if matches any ignore pattern (by context line)
+        line_start = text.rfind("\n", 0, s) + 1
+        line_end   = text.find("\n", e)
+        if line_end == -1: line_end = len(text)
+        line = text[line_start:line_end]
+        if any(p.search(line) for p in compiled):
+            continue
+
+        # Ignore 1–2 digit integers (but keep decimals like 2.5 or 0.7)
+        if ignore_short_standalone:
+            norm = normalize_number_str(n)
+            if re.fullmatch(r"\d{1,2}", norm):
+                continue
+
+        out.append((n, s, e))
+    return out
+
+# =========================
+# Readers (txt/docx/pptx/xlsx/csv/tsv/XLIFF)
+# =========================
 def _read_text_txt(path: pathlib.Path) -> str:
     return path.read_text(encoding="utf-8", errors="ignore")
 
@@ -211,12 +256,15 @@ def read_xliff_pair(path: pathlib.Path) -> tuple[str, str]:
             src_text = "\n".join("".join(n.itertext()) for n in seg_sources)
     return src_text, tgt_text
 
-# ---- Comparisons ----
-def _compare_pairs(src_text: str, tgt_text: str):
+# =========================
+# Comparisons
+# =========================
+def _compare_pairs(src_text: str, tgt_text: str, float_tol: float = 1e-9):
     src_text_norm = normalize_digits(src_text)
     tgt_text_norm = normalize_digits(tgt_text)
-    src_pairs = [(m[0], m[1], m[2], m[3]) for m in find_pairs(src_text_norm)]
-    tgt_pairs = [(m[0], m[1], m[2], m[3]) for m in find_pairs(tgt_text_norm)]
+
+    src_pairs = [(m[0], m[1], m[2], m[3]) for m in find_pairs_with_spans(src_text_norm)]
+    tgt_pairs = [(m[0], m[1], m[2], m[3]) for m in find_pairs_with_spans(tgt_text_norm)]
 
     src_keyed = defaultdict(list)
     for num, unit, s, e in src_pairs:
@@ -236,28 +284,68 @@ def _compare_pairs(src_text: str, tgt_text: str):
         tgt_count = Counter(tgt_list)
 
         for k in (src_count - tgt_count).elements():
-            cn, cf, s, e, onum, ounit = next(x for x in src_keyed[unit] if x[0] == k)
-            missing.append({"unit": unit, "value": k, "orig_num": onum, "orig_unit": ounit, "note": "Present in source, missing in target"})
+            missing.append({"unit": unit, "value": k, "orig_num": k, "orig_unit": unit, "note": "Present in source, missing in target"})
         for k in (tgt_count - src_count).elements():
-            cn, cf, s, e, onum, ounit = next(x for x in tgt_keyed[unit] if x[0] == k)
-            extra.append({"unit": unit, "value": k, "orig_num": onum, "orig_unit": ounit, "note": "Present in target, not in source"})
+            extra.append({"unit": unit, "value": k, "orig_num": k, "orig_unit": unit, "note": "Present in target, not in source"})
 
         m = min(len(src_list), len(tgt_list))
         for i in range(m):
             s_val, t_val = src_list[i], tgt_list[i]
             if s_val != t_val:
                 sf, tf = as_float_safe(s_val), as_float_safe(t_val)
-                if sf is None or tf is None or abs(sf - tf) > 1e-9:
+                if sf is None or tf is None or abs(sf - tf) > float_tol:
                     changed.append({"unit": unit, "source_value": s_val, "target_value": t_val, "note": "Numeric value differs"})
-    return missing, extra, changed
+    return missing, extra, changed, src_pairs, tgt_pairs
 
-def _compare_pure_numbers(src_text: str, tgt_text: str):
-    src_vals = [canonical_number(n)[0] for n, _, _ in find_pure_numbers(normalize_digits(src_text))]
-    tgt_vals = [canonical_number(n)[0] for n, _, _ in find_pure_numbers(normalize_digits(tgt_text))]
-    return Counter(src_vals), Counter(tgt_vals)
+def _compare_pure_numbers(src_text: str, tgt_text: str,
+                          ignore_short_standalone: bool,
+                          ignore_patterns: Optional[List[str]],
+                          pair_spans_src: List[Tuple[int,int]],
+                          pair_spans_tgt: List[Tuple[int,int]]):
+    # Find pure numbers
+    src_nums = find_pure_numbers_with_spans(src_text)
+    tgt_nums = find_pure_numbers_with_spans(tgt_text)
 
-# ---- Public API ----
-def audit_files(source_path, target_path, out_xlsx: Optional[str | pathlib.Path] = None):
+    # Remove anything overlapping a number+unit pair
+    src_nums = _subtract_overlaps(src_nums, pair_spans_src)
+    tgt_nums = _subtract_overlaps(tgt_nums, pair_spans_tgt)
+
+    # Apply ignore rules
+    src_nums = _apply_ignore_rules(src_text, src_nums, ignore_short_standalone, ignore_patterns)
+    tgt_nums = _apply_ignore_rules(tgt_text, tgt_nums, ignore_short_standalone, ignore_patterns)
+
+    # Count by canonical value
+    def counts(items):
+        vals = [canonical_number(n)[0] for n, _, _ in items]
+        return Counter(vals)
+
+    return counts(src_nums), counts(tgt_nums)
+
+# =========================
+# Public API
+# =========================
+def audit_files(
+    source_path,
+    target_path,
+    out_xlsx: Optional[str | pathlib.Path] = None,
+    *,
+    ignore_short_standalone: bool = True,
+    ignore_patterns: Optional[List[str]] = None,
+    float_tol: float = 1e-9,
+):
+    """
+    Compare numbers and number+unit pairs between two files.
+
+    Parameters
+    ----------
+    ignore_short_standalone : bool
+        Ignore plain integers with 1–2 digits when comparing pure numbers (keeps decimals like 2.5).
+    ignore_patterns : List[str] | None
+        Regex patterns. If a pure number occurs on a line matching any pattern, it is ignored.
+        Examples: r"^\\s*\\d+\\s*$"  (page numbers), r"Figure\\s+\\d+"
+    float_tol : float
+        Tolerance when comparing numeric values inside number+unit pairs.
+    """
     _lazy_imports()
     src_p = pathlib.Path(source_path)
     tgt_p = pathlib.Path(target_path)
@@ -279,9 +367,21 @@ def audit_files(source_path, target_path, out_xlsx: Optional[str | pathlib.Path]
         else:
             target_text = read_text_from_file(tgt_p)
 
-    # Compare
-    missing_pairs, extra_pairs, changed_pairs = _compare_pairs(source_text, target_text)
-    src_num_counts, tgt_num_counts = _compare_pure_numbers(source_text, target_text)
+    # Compare pairs
+    missing_pairs, extra_pairs, changed_pairs, src_pairs, tgt_pairs = _compare_pairs(
+        source_text, target_text, float_tol=float_tol
+    )
+
+    # Pure numbers: exclude overlaps with pairs, ignore short ints & patterns
+    src_pair_spans = [(s, e) for _, _, s, e in src_pairs]
+    tgt_pair_spans = [(s, e) for _, _, s, e in tgt_pairs]
+    src_num_counts, tgt_num_counts = _compare_pure_numbers(
+        source_text, target_text,
+        ignore_short_standalone=ignore_short_standalone,
+        ignore_patterns=ignore_patterns,
+        pair_spans_src=src_pair_spans,
+        pair_spans_tgt=tgt_pair_spans,
+    )
 
     if pd is None:
         raise RuntimeError("pandas not installed. pip install pandas openpyxl")
@@ -336,14 +436,3 @@ def audit_files(source_path, target_path, out_xlsx: Optional[str | pathlib.Path]
                 df.to_excel(writer, sheet_name=name[:31], index=False)
 
     return result
-
-# Optional CLI for quick local testing (no Streamlit)
-if __name__ == "__main__":
-    import argparse
-    ap = argparse.ArgumentParser()
-    ap.add_argument("source")
-    ap.add_argument("target")
-    ap.add_argument("--out", default="numbers_units_audit.xlsx")
-    args = ap.parse_args()
-    audit_files(args.source, args.target, out_xlsx=args.out)
-    print(f"Done. Wrote {args.out}")
